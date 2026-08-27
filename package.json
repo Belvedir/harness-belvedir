@@ -1,0 +1,14 @@
+{
+  "name": "harness-belvedir",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Belvedir's first-party benchmark driver: a fixed runner (task parsing, verifier dispatch, results) around a minimal default agent harness (task -> model -> output).",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node run.js",
+    "test": "node test/run-tests.js"
+  }
+}
