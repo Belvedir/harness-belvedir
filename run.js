@@ -29,6 +29,8 @@
 // verifier:
 //   {"task": "...", "verify": {"kind": "judge", "expect": "..."}}
 //   {"task": "...", "expect": "..."}
+//   {"task": "...", "verify": {"kind": "rubric", "criteria": ["...", ...],
+//                              "expect": "..."?}}   // partial credit per criterion
 
 "use strict";
 const fs = require("fs");
@@ -167,29 +169,93 @@ function judgeUserPrompt(task, expect, attempt) {
   ].join("\n");
 }
 
+// A verdict is {score in 0..1, pass, reason}. The judge verifier is binary;
+// the rubric verifier gives partial credit (fraction of criteria met).
 function parseVerdict(text) {
   const match = String(text).match(/\{[\s\S]*\}/);
   if (!match) return null;
   try {
     const obj = JSON.parse(match[0]);
     if (typeof obj.pass !== "boolean") return null;
-    return { pass: obj.pass, reason: String(obj.reason ?? "").slice(0, 200) };
+    return {
+      score: obj.pass ? 1 : 0,
+      pass: obj.pass,
+      reason: String(obj.reason ?? "").slice(0, 200),
+    };
   } catch {
     return null;
   }
 }
 
-async function judgeVerify(judge, task, expect, attempt) {
-  // Degenerate responders never reach the judge: an empty answer or a
-  // task echo must not pass, and must not spend judge tokens finding out.
-  if (!normalized(attempt)) return { pass: false, reason: "empty attempt" };
-  if (normalized(attempt) === normalized(task)) {
-    return { pass: false, reason: "attempt echoes the task" };
+function rubricUserPrompt(task, criteria, expect, attempt) {
+  const numbered = criteria
+    .map((c, i) => `${i + 1}. ${clip(c, 500)}`)
+    .join("\n");
+  return [
+    "Task the agent was given:",
+    `<task>\n${clip(task, JUDGE_CLIP_CHARS)}\n</task>`,
+    "",
+    "Criteria. Grade EACH one independently against the attempt:",
+    `<criteria>\n${numbered}\n</criteria>`,
+    ...(expect
+      ? [
+          "",
+          "Reference outcome, as EVIDENCE of what success looks like (not the",
+          "only acceptable answer):",
+          `<reference>\n${clip(expect, JUDGE_CLIP_CHARS)}\n</reference>`,
+        ]
+      : []),
+    "",
+    "Attempt to grade:",
+    `<attempt>\n${clip(attempt, JUDGE_CLIP_CHARS)}\n</attempt>`,
+    "",
+    "For each criterion, decide whether the attempt satisfies it. A different",
+    "approach, format, or wording still satisfies a criterion; grade outcomes,",
+    "not style. An empty, evasive, or task-restating attempt satisfies nothing.",
+    `Respond with ONLY: {"met": [${criteria.map(() => "true or false").join(", ")}], "reason": "<one short sentence on the first unmet criterion, or 'all met'>"}`,
+    `The "met" array must have exactly ${criteria.length} booleans, in criteria order.`,
+  ].join("\n");
+}
+
+function parseRubricVerdict(text, criteriaCount) {
+  const match = String(text).match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const obj = JSON.parse(match[0]);
+    if (
+      !Array.isArray(obj.met) ||
+      obj.met.length !== criteriaCount ||
+      obj.met.some((m) => typeof m !== "boolean")
+    ) {
+      return null;
+    }
+    const met = obj.met.filter(Boolean).length;
+    const score = met / criteriaCount;
+    return {
+      score,
+      pass: score >= 0.5,
+      reason: String(obj.reason ?? "").slice(0, 200),
+      met,
+    };
+  } catch {
+    return null;
   }
-  const messages = [
-    { role: "system", content: JUDGE_SYSTEM },
-    { role: "user", content: judgeUserPrompt(task, expect, attempt) },
-  ];
+}
+
+/** Degenerate-responder guard shared by every LLM-graded verifier: an empty
+ * answer or a task echo must not pass, and must not spend judge tokens
+ * finding out. Returns a failing verdict or null to proceed. */
+function degenerateVerdict(task, attempt) {
+  if (!normalized(attempt)) {
+    return { score: 0, pass: false, reason: "empty attempt" };
+  }
+  if (normalized(attempt) === normalized(task)) {
+    return { score: 0, pass: false, reason: "attempt echoes the task" };
+  }
+  return null;
+}
+
+async function askJudge(judge, messages, parse) {
   // One re-ask on an unparseable verdict before counting a judge error.
   for (let i = 0; i < 2; i++) {
     const text = await chat(judge, messages, {
@@ -197,10 +263,37 @@ async function judgeVerify(judge, task, expect, attempt) {
       maxTokens: 512,
       temperature: 0,
     });
-    const verdict = parseVerdict(text);
+    const verdict = parse(text);
     if (verdict) return verdict;
   }
   throw new Error("judge returned no parseable verdict");
+}
+
+async function verify(judge, taskLine, attempt) {
+  const degenerate = degenerateVerdict(taskLine.task, attempt);
+  if (degenerate) return degenerate;
+  const v = taskLine.verify;
+  if (v.kind === "rubric") {
+    return askJudge(
+      judge,
+      [
+        { role: "system", content: JUDGE_SYSTEM },
+        {
+          role: "user",
+          content: rubricUserPrompt(taskLine.task, v.criteria, v.expect, attempt),
+        },
+      ],
+      (text) => parseRubricVerdict(text, v.criteria.length)
+    );
+  }
+  return askJudge(
+    judge,
+    [
+      { role: "system", content: JUDGE_SYSTEM },
+      { role: "user", content: judgeUserPrompt(taskLine.task, v.expect, attempt) },
+    ],
+    parseVerdict
+  );
 }
 
 function parseTasks(raw) {
@@ -224,15 +317,30 @@ function parseTasks(raw) {
     if (!verify || typeof verify !== "object" || !verify.kind) {
       fail(`task file line ${i + 1} has no verifier ("verify" or "expect")`);
     }
-    if (verify.kind !== "judge") {
+    if (verify.kind === "judge") {
+      if (typeof verify.expect !== "string" || !verify.expect.trim()) {
+        fail(`task file line ${i + 1}: the judge verifier needs an "expect" string`);
+      }
+    } else if (verify.kind === "rubric") {
+      if (
+        !Array.isArray(verify.criteria) ||
+        verify.criteria.length === 0 ||
+        verify.criteria.length > 20 ||
+        verify.criteria.some((c) => typeof c !== "string" || !c.trim())
+      ) {
+        fail(
+          `task file line ${i + 1}: the rubric verifier needs "criteria", 1-20 non-empty strings`
+        );
+      }
+      if (verify.expect !== undefined && typeof verify.expect !== "string") {
+        fail(`task file line ${i + 1}: rubric "expect" must be a string when present`);
+      }
+    } else {
       // Refusing beats silently judge-grading a task that shipped a
       // different verifier — the score would measure the wrong thing.
       fail(
-        `task file line ${i + 1} uses verifier kind "${verify.kind}"; this runner supports: judge`
+        `task file line ${i + 1} uses verifier kind "${verify.kind}"; this runner supports: judge, rubric`
       );
-    }
-    if (typeof verify.expect !== "string" || !verify.expect.trim()) {
-      fail(`task file line ${i + 1}: the judge verifier needs an "expect" string`);
     }
     tasks.push({ index: tasks.length, task, verify });
   }
@@ -320,19 +428,23 @@ async function main() {
           });
         } catch (e) {
           attemptErrors++;
-          verdicts.push({ pass: false, reason: `attempt error: ${String(e.message).slice(0, 150)}` });
+          verdicts.push({ score: 0, pass: false, reason: `attempt error: ${String(e.message).slice(0, 150)}` });
           continue;
         }
         try {
-          verdicts.push(await judgeVerify(judge, t.task, t.verify.expect, output));
+          verdicts.push(await verify(judge, t, output));
           judgedAttempts++;
         } catch (e) {
           judgeErrors++;
-          verdicts.push({ pass: false, reason: `judge error: ${String(e.message).slice(0, 150)}` });
+          verdicts.push({ score: 0, pass: false, reason: `judge error: ${String(e.message).slice(0, 150)}` });
         }
       }
-      const passes = verdicts.filter((v) => v.pass).length;
-      t.score = grading === "pass@k" ? (passes > 0 ? 1 : 0) : passes / verdicts.length;
+      t.score =
+        grading === "pass@k"
+          ? verdicts.some((v) => v.pass)
+            ? 1
+            : 0
+          : verdicts.reduce((s, v) => s + v.score, 0) / verdicts.length;
       t.pass = t.score >= 0.5;
       t.reason = verdicts[0]?.reason ?? "";
       log(`task ${t.index + 1}/${tasks.length}: ${t.pass ? "pass" : "fail"}${t.reason ? ` (${t.reason})` : ""}`);

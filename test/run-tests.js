@@ -23,7 +23,12 @@ const server = http.createServer((req, res) => {
     // Judge requests are recognized by prompt shape, not model id — the
     // self-grading test points JUDGE_MODEL at the model under test.
     const isJudge = user.includes("<attempt>");
-    if (isJudge) {
+    if (isJudge && user.includes("<criteria>")) {
+      // Rubric grading: a criterion containing MEETABLE is met.
+      const criteria = (user.match(/^\d+\. .*$/gm) || []).map((l) => l.replace(/^\d+\. /, ""));
+      const met = criteria.map((c) => c.includes("MEETABLE"));
+      content = JSON.stringify({ met, reason: "graded per criterion" });
+    } else if (isJudge) {
       const attempt = (user.match(/<attempt>\n([\s\S]*?)\n<\/attempt>/) || [])[1] || "";
       const pass = attempt.includes("correct final answer");
       content = JSON.stringify({ pass, reason: pass ? "accomplishes the task" : "does not" });
@@ -137,6 +142,38 @@ async function main(base) {
   });
   const r5 = JSON.parse(fs.readFileSync(path.join(dir, "results.json"), "utf8"));
   check("pass@k over attempts", r.status === 0 && r5.score === 1 && r5.attempts_per_task === 2, r.stdout);
+
+  // 6. Rubric verifier: partial credit (3 of 4 criteria met -> 0.75, pass),
+  // and a degenerate echo fails a rubric task without a judge call.
+  fs.writeFileSync(
+    tasksFile,
+    [
+      JSON.stringify({
+        task: "Produce the report",
+        verify: {
+          kind: "rubric",
+          criteria: ["MEETABLE one", "MEETABLE two", "MEETABLE three", "unmeetable"],
+          expect: "a reference report",
+        },
+      }),
+      JSON.stringify({
+        task: "ECHO this rubric task",
+        verify: { kind: "rubric", criteria: ["MEETABLE anything"] },
+      }),
+    ].join("\n")
+  );
+  r = await runRunner(dir, { MODEL_API_BASE: base, BELVEDIR_TASKS_FILE: tasksFile });
+  const r6 = JSON.parse(fs.readFileSync(path.join(dir, "results.json"), "utf8"));
+  const rubricTask = r6.tasks.find((t) => t.index === 0);
+  const rubricEcho = r6.tasks.find((t) => t.index === 1);
+  check("rubric partial credit 0.75", r.status === 0 && rubricTask?.score === 0.75 && rubricTask?.pass === true, JSON.stringify(r6));
+  check("rubric echo fails degenerately", rubricEcho?.score === 0 && /echoes the task/.test(rubricEcho?.reason ?? ""), JSON.stringify(rubricEcho));
+  check("overall score averages rubric scores", r6.score === (0.75 + 0) / 2, `got ${r6.score}`);
+
+  // 7. Rubric validation: empty criteria refuse up front.
+  fs.writeFileSync(tasksFile, JSON.stringify({ task: "x", verify: { kind: "rubric", criteria: [] } }));
+  r = await runRunner(dir, { MODEL_API_BASE: base, BELVEDIR_TASKS_FILE: tasksFile });
+  check("empty rubric criteria refuse", r.status === 1 && /criteria/.test(r.stdout), r.stdout);
 
   fs.rmSync(dir, { recursive: true, force: true });
 }

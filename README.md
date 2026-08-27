@@ -32,10 +32,14 @@ the judge verifier:
 ```jsonl
 {"task": "Summarize the three most recent inbox items", "verify": {"kind": "judge", "expect": "mentions all three subjects"}}
 {"task": "Schedule a 30-minute meeting tomorrow avoiding conflicts", "expect": "picks a free slot"}
+{"task": "Draft the renewal email", "verify": {"kind": "rubric", "criteria": ["references the correct contract", "proposes a date", "professional tone"], "expect": "..."}}
 ```
 
-Supported verifier kinds today: `judge`. A task set carrying an unsupported
-kind fails the run up front rather than being silently judge-graded.
+Supported verifier kinds today: `judge` (binary, graded against a reference)
+and `rubric` (per-criterion grading with partial credit — a task's score is
+the fraction of criteria met, and it passes at ≥ 0.5; `expect` is optional
+extra evidence). A task set carrying an unsupported kind fails the run up
+front rather than being silently judge-graded.
 
 ### How the judge grades
 
