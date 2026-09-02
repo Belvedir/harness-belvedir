@@ -61,4 +61,63 @@ function commandHarness(cmd) {
     });
 }
 
-module.exports = { defaultHarness, commandHarness, SYSTEM_PROMPT };
+// urlHarness is the HTTP seam (Sept 2, mirrors belvedir_harbor.agent):
+// BELVEDIR_AGENT_URL names a service that IS the agent — POST
+// {"task", "instruction", "run_id"} as JSON (bearer BELVEDIR_AGENT_TOKEN when
+// set); the reply's answer-like string field ("answer"/"output"/"content"/
+// "text"/"result"/"response", an OpenAI-shaped choices[0].message.content, a
+// JSON string) or the raw body is the attempt.
+const URL_TIMEOUT_MS = 300_000;
+
+function parseAgentReply(text) {
+  const trimmed = String(text ?? "").trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith('"')) {
+    let obj;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return text;
+    }
+    if (typeof obj === "string") return obj;
+    if (obj && typeof obj === "object") {
+      for (const key of ["answer", "output", "content", "text", "result", "response"]) {
+        if (typeof obj[key] === "string") return obj[key];
+      }
+      const content = obj?.choices?.[0]?.message?.content;
+      if (typeof content === "string") return content;
+      throw new Error("agent reply is JSON without an answer-like string field");
+    }
+  }
+  return text;
+}
+
+function urlHarness(url) {
+  return async (task) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), URL_TIMEOUT_MS);
+    try {
+      const token = (process.env.BELVEDIR_AGENT_TOKEN || "").trim();
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/plain",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          task,
+          instruction: task,
+          run_id: process.env.BELVEDIR_RUN_ID || process.env.FRACTAL_RUN_ID || null,
+        }),
+        signal: controller.signal,
+      });
+      const text = await res.text();
+      if (!res.ok) throw new Error(`agent HTTP ${res.status}: ${text.slice(0, 300)}`);
+      return parseAgentReply(text);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
+module.exports = { defaultHarness, commandHarness, urlHarness, parseAgentReply, SYSTEM_PROMPT };

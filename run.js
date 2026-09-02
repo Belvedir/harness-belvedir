@@ -23,6 +23,9 @@
 //          BELVEDIR_GRADING        pass@1 | pass@k | mean
 //          BELVEDIR_HARNESS_CMD    harness seam: shell command run per task
 //                                  (task on stdin + $TASK, attempt on stdout)
+//          BELVEDIR_AGENT_URL      harness seam: HTTP agent — POST the task
+//                                  as JSON, the reply is the attempt
+//                                  (bearer BELVEDIR_AGENT_TOKEN when set)
 //   writes results.json at the repo root: numeric top-level score in 0..1
 //
 // Task lines are verifier-tagged; bare {task, expect} is sugar for the judge
@@ -34,7 +37,7 @@
 
 "use strict";
 const fs = require("fs");
-const { defaultHarness, commandHarness } = require("./harness");
+const { defaultHarness, commandHarness, urlHarness } = require("./harness");
 
 // Never the model under test: an unset judge must not silently self-grade.
 const DEFAULT_JUDGE_MODEL = "anthropic/claude-haiku-4-5";
@@ -417,10 +420,15 @@ async function main() {
   );
   const grading = (process.env.BELVEDIR_GRADING || "pass@1").toLowerCase();
   const harnessCmd = (process.env.BELVEDIR_HARNESS_CMD || "").trim();
-  const harness = harnessCmd ? commandHarness(harnessCmd) : defaultHarness;
+  const agentUrl = (process.env.BELVEDIR_AGENT_URL || "").trim();
+  const harness = harnessCmd
+    ? commandHarness(harnessCmd)
+    : agentUrl
+      ? urlHarness(agentUrl)
+      : defaultHarness;
   log(
     `${tasks.length} tasks · model ${model.model} · judge ${judge.model} · ${attempts} attempt(s), ${grading}` +
-      (harnessCmd ? " · harness: command" : " · harness: minimal loop")
+      (harnessCmd ? " · harness: command" : agentUrl ? " · harness: http agent" : " · harness: minimal loop")
   );
 
   let attemptErrors = 0;
