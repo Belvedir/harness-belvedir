@@ -269,10 +269,24 @@ async function askJudge(judge, messages, parse) {
   throw new Error("judge returned no parseable verdict");
 }
 
+/** An attempt identical to the reference passes without a judge call — the
+ * reference is known-good by definition, and judges reliably fail a verbatim
+ * reference as "copied, not composed" on originality-flavored tasks (seen
+ * Sept 2 in the Harbor oracle check, which grades exactly this case). Mirrors
+ * belvedir_harbor/verify.py. */
+function referenceMatchVerdict(expect, attempt) {
+  if (expect && normalized(attempt) === normalized(expect)) {
+    return { score: 1, pass: true, reason: "attempt matches the reference" };
+  }
+  return null;
+}
+
 async function verify(judge, taskLine, attempt) {
   const degenerate = degenerateVerdict(taskLine.task, attempt);
   if (degenerate) return degenerate;
   const v = taskLine.verify;
+  const matched = referenceMatchVerdict(v.expect, attempt);
+  if (matched) return matched;
   if (v.kind === "rubric") {
     return askJudge(
       judge,
@@ -334,6 +348,10 @@ function parseTasks(raw) {
       }
       if (verify.expect !== undefined && typeof verify.expect !== "string") {
         fail(`task file line ${i + 1}: rubric "expect" must be a string when present`);
+      }
+      // A blank reference is no reference (mirrors the Harbor exporter).
+      if (typeof verify.expect === "string" && !verify.expect.trim()) {
+        delete verify.expect;
       }
     } else {
       // Refusing beats silently judge-grading a task that shipped a
